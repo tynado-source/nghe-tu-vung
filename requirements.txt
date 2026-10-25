@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+httpx
+yt-dlp
+edge-tts
+lameenc
