@@ -239,6 +239,130 @@ def extract(req: Req, x_token: str = Header(default="")):
         return {"items": items, "transcript": transcript}
 
 
+class Seg(BaseModel):
+    text: str
+    lang: str          # cs | vi | en | ja ...
+    pause: int = 300   # ms nghỉ sau đoạn
+    i: int = 0         # số thứ tự đoạn (để app tô sáng đoạn đang đọc)
+
+
+class SegReq(BaseModel):
+    segs: list[Seg]
+
+
+@app.post("/api/tts-segments")
+async def tts_segments(req: SegReq, x_token: str = Header(default="")):
+    """Đọc ngữ pháp / câu chuyện: mỗi đoạn một giọng (Việt xen Séc...)."""
+    if APP_TOKEN and x_token != APP_TOKEN:
+        raise HTTPException(401, "Sai mật khẩu máy chủ")
+    if len(req.segs) > 800 or sum(len(s.text) for s in req.segs) > 12000:
+        raise HTTPException(400, "Nội dung quá dài")
+    voice = lambda s: VOICES.get(s.lang, VOICES["en"])
+    todo = list({(s.text, voice(s)) for s in req.segs})
+    audio = dict(zip(todo, await asyncio.gather(*(synth(t, v) for t, v in todo))))
+    out, marks, t = bytearray(), [], 0.0
+    for s in req.segs:
+        marks.append({"i": s.i, "t": round(t, 2)})
+        b = audio[(s.text, voice(s))]
+        out.extend(b)
+        t += len(b) / BYTES_PER_SEC
+        p = max(50, min(s.pause, 3000))
+        out.extend(silence(p))
+        t += p / 1000
+    return {"audio": base64.b64encode(bytes(out)).decode(), "marks": marks, "dur": round(t, 2)}
+
+
+# ---------- Tự sắp xếp ngữ pháp / câu chuyện từ văn bản dán vào ----------
+class OrgReq(BaseModel):
+    kind: str                       # grammar | story
+    text: str
+    lang_name: str = "tiếng Séc"
+    words: list[str] = []           # từ vựng của bài (để đặt vào ngoặc vuông trong truyện)
+
+
+def groq_items(system: str, user: str) -> list:
+    if not GROQ_KEY:
+        raise HTTPException(500, "Máy chủ chưa có GROQ_API_KEY")
+    for _ in range(2):
+        r = httpx.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            json={"model": TEXT_MODEL, "temperature": 0.2, "max_tokens": 6000,
+                  "response_format": {"type": "json_object"},
+                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]},
+            timeout=90,
+        )
+        if r.status_code == 429:
+            raise HTTPException(429, "Groq đang giới hạn lượt dùng, đợi 1 phút rồi thử lại")
+        if r.status_code >= 400:
+            raise HTTPException(502, f"Lỗi AI: {r.text[:200]}")
+        try:
+            data = json.loads(r.json()["choices"][0]["message"]["content"])
+            items = data.get("items") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                return items
+        except Exception:
+            pass
+    raise HTTPException(502, "AI trả kết quả không đúng định dạng, hãy thử lại")
+
+
+@app.post("/api/organize")
+def organize(req: OrgReq, x_token: str = Header(default="")):
+    if APP_TOKEN and x_token != APP_TOKEN:
+        raise HTTPException(401, "Sai mật khẩu máy chủ")
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, "Chưa có nội dung")
+    if len(text) > 9000:
+        raise HTTPException(400, "Văn bản dài quá (tối đa 9000 ký tự), hãy chia nhỏ ra dán từng đợt")
+    lang = req.lang_name
+    if req.kind == "grammar":
+        system = (
+            f"Bạn là giáo viên dạy {lang} cho người Việt. Người dùng dán ghi chú ngữ pháp còn lộn xộn. "
+            "Hãy sắp xếp thành các điểm ngữ pháp riêng biệt, mỗi điểm một ý chính. Với mỗi điểm trả về: "
+            '"title" (tên điểm, ngắn gọn, tiếng Việt), '
+            '"body" (giải thích bằng tiếng Việt, rõ ràng, giữ đúng ý và quy tắc trong ghi chú của người dùng, '
+            "không bịa thêm quy tắc ngoài ghi chú; có thể nhiều đoạn), "
+            f'"ex" (đúng 2 ví dụ, mỗi ví dụ gồm "cs" = câu bằng {lang} đúng chính tả và ngữ pháp, '
+            '"vi" = nghĩa tiếng Việt). Nếu ghi chú đã có ví dụ thì dùng ví dụ của người dùng '
+            "(chỉ sửa lỗi chính tả); nếu thiếu thì tự viết ví dụ đơn giản, đúng, minh hoạ đúng quy tắc đó. "
+            'Chỉ trả về JSON dạng {"items":[{"title":"","body":"","ex":[{"cs":"","vi":""},{"cs":"","vi":""}]}]}'
+        )
+        items = groq_items(system, text)
+        out = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            title, body = str(it.get("title", "")).strip(), str(it.get("body", "")).strip()
+            ex = [{"cs": str(e.get("cs", "")).strip(), "vi": str(e.get("vi", "")).strip()}
+                  for e in (it.get("ex") or []) if isinstance(e, dict) and str(e.get("cs", "")).strip()][:2]
+            if title and body:
+                out.append({"title": title, "body": body, "ex": ex})
+        return {"items": out}
+    if req.kind == "story":
+        words = ", ".join(w for w in req.words[:80] if w.strip())
+        system = (
+            f"Người dùng gửi các phần của câu chuyện viết bằng tiếng Việt có chêm {lang} "
+            "(có thể ghi 'phần 1', 'phần 2'... hoặc để lẫn lộn). Hãy gom lại thành các câu chuyện hoàn chỉnh, "
+            "sắp xếp các phần theo đúng thứ tự, giữ nguyên nội dung và giọng văn của người dùng (chỉ sửa lỗi chính tả). "
+            f"Mọi từ hoặc cụm từ bằng {lang} phải được đặt trong ngoặc vuông [ ], phần tiếng Việt thì không. "
+            "Giữ lại các ngoặc vuông người dùng đã đặt. "
+            + (f"Các từ vựng sau cũng là {lang}, hãy đặt vào ngoặc vuông nếu xuất hiện: {words}. " if words else "")
+            + 'Mỗi truyện có "title" ngắn bằng tiếng Việt và "text" là toàn bộ nội dung (giữ xuống dòng). '
+            'Chỉ trả về JSON dạng {"items":[{"title":"","text":""}]}'
+        )
+        items = groq_items(system, text)
+        out = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            title, body = str(it.get("title", "")).strip(), str(it.get("text", "")).strip()
+            if body:
+                out.append({"title": title or "Câu chuyện", "text": body})
+        return {"items": out}
+    raise HTTPException(400, "kind phải là grammar hoặc story")
+
+
 # Trang app (bản web cho iPhone / trình duyệt) phục vụ ngay tại địa chỉ máy chủ
 if pathlib.Path("static").exists():
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
